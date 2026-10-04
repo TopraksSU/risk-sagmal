@@ -1,0 +1,228 @@
+            (_scaled(expected_gap, PARAMS["expected_gap_full_risk"]), PARAMS["udder_expected_gap_weight"]),
+            (_scaled(worst_quarter_gap, PARAMS["quarter_gap_full_risk"]), PARAMS["udder_quarter_gap_weight"]),
+            (_scaled(flow_drop, PARAMS["flow_full_risk_drop"]), PARAMS["udder_flow_weight"]),
+            (_scaled(yield_alarm_rate, PARAMS["yield_alarm_full_risk"]), PARAMS["udder_yield_alarm_weight"]),
+        ])
+
+        ok_col = "mvc_milkvisitstatusok" if "mvc_milkvisitstatusok" in m.columns else ("mvpr_milkvisitstatusok_general" if "mvpr_milkvisitstatusok_general" in m.columns else None)
+        prior_ok_day = recent_ok_day = failed_inc = None
+        if ok_col:
+            prior_m = m[m["__date"].isin(prior_dates)]
+            recent_m = m[m["__date"].isin(recent_dates)]
+            pb = _bool_series(prior_m[ok_col]).dropna()
+            rb = _bool_series(recent_m[ok_col]).dropna()
+            if len(prior_dates) and not pb.empty:
+                prior_ok_day = float(pb.sum() / len(prior_dates))
+            if len(recent_dates) and not rb.empty:
+                recent_ok_day = float(rb.sum() / len(recent_dates))
+            if not pb.empty and not rb.empty:
+                failed_inc = max(0.0, float((~rb).mean() - (~pb).mean()))
+        ok_drop = _drop(recent_ok_day, prior_ok_day)
+
+        incomplete_cols = ["mvpr_teatincomplete_fl", "mvpr_teatincomplete_fr", "mvpr_teatincomplete_rl", "mvpr_teatincomplete_rr"]
+        prior_incomplete = _period_rate_any(m, incomplete_cols, prior_dates)
+        recent_incomplete = _period_rate_any(m, incomplete_cols, recent_dates)
+        incomplete_inc = max(0.0, recent_incomplete - prior_incomplete) if prior_incomplete is not None and recent_incomplete is not None else None
+
+        abort_cols = ["mvpr_attachmentaborted_general"]
+        prior_abort = _period_rate_any(m, abort_cols, prior_dates)
+        recent_abort = _period_rate_any(m, abort_cols, recent_dates)
+        abort_inc = max(0.0, recent_abort - prior_abort) if prior_abort is not None and recent_abort is not None else None
+
+        prior_reattach = _period_numeric_event_mean(m, ["mvpr_reattach_general"], prior_dates)
+        recent_reattach = _period_numeric_event_mean(m, ["mvpr_reattach_general"], recent_dates)
+        reattach_inc = _relative_increase(recent_reattach, prior_reattach)
+
+        kickoff_cols = ["mvpr_kickoff_fl", "mvpr_kickoff_fr", "mvpr_kickoff_rl", "mvpr_kickoff_rr"]
+        prior_kickoff = _period_numeric_event_mean(m, kickoff_cols, prior_dates)
+        recent_kickoff = _period_numeric_event_mean(m, kickoff_cols, recent_dates)
+        kickoff_inc = _relative_increase(recent_kickoff, prior_kickoff)
+
+        robot_risk, robot_coverage = _weighted_available([
+            (_scaled(ok_drop, PARAMS["robot_ok_drop_full_risk"]), PARAMS["robot_ok_drop_weight"]),
+            (_scaled(failed_inc, PARAMS["robot_rate_inc_full_risk"]), PARAMS["robot_failed_inc_weight"]),
+            (_scaled(incomplete_inc, PARAMS["robot_rate_inc_full_risk"]), PARAMS["robot_incomplete_inc_weight"]),
+            (_scaled(abort_inc, PARAMS["robot_rate_inc_full_risk"]), PARAMS["robot_abort_inc_weight"]),
+            (_scaled(reattach_inc, PARAMS["robot_reattach_full_risk"]), PARAMS["robot_reattach_inc_weight"]),
+            (_scaled(kickoff_inc, PARAMS["robot_kickoff_full_risk"]), PARAMS["robot_kickoff_inc_weight"]),
+        ])
+
+        general_risk, general_coverage = _weighted_available([
+            (rum_risk, PARAMS["general_rumination_weight"]),
+            (feed_risk, PARAMS["general_feeding_weight"]),
+            (activity_risk, PARAMS["general_activity_weight"]),
+            (milk_risk, PARAMS["general_milk_weight"]),
+            (robot_risk, PARAMS["general_robot_weight"]),
+        ])
+
+        strong_count = sum(1 for x in [rum_risk, feed_risk, activity_risk, milk_risk] if x is not None and x >= PARAMS["strong_signal_threshold"])
+
+        overall, overall_coverage = _weighted_available([
+            (general_risk, PARAMS["overall_general_weight"]),
+            (udder_risk, PARAMS["overall_udder_weight"]),
+            (robot_risk, PARAMS["overall_robot_weight"]),
+        ])
+        if overall is not None:
+            if general_risk is not None and general_risk >= PARAMS["general_escalation_threshold"] and strong_count >= PARAMS["multi_signal_count_threshold"]:
+                overall = max(overall, PARAMS["general_escalation_threshold"])
+            if udder_risk is not None and udder_risk >= PARAMS["udder_escalation_threshold"]:
+                overall = max(overall, PARAMS["udder_escalation_floor"])
+            if general_risk is not None and udder_risk is not None and general_risk >= PARAMS["general_udder_joint_threshold"] and udder_risk >= PARAMS["general_udder_joint_threshold"]:
+                overall = max(overall, PARAMS["general_udder_joint_floor"])
+
+        if overall is None:
+            level = "VERİ EKSİK"
+        elif overall >= PARAMS["high_threshold"]:
+            level = "YÜKSEK"
+        elif overall >= PARAMS["medium_threshold"]:
+            level = "ORTA"
+        elif overall >= PARAMS["watch_threshold"]:
+            level = "İZLE"
+        else:
+            level = "DÜŞÜK"
+
+        explanation = []
+        if general_risk is not None and general_risk >= 60:
+            explanation.append("Genel sağlık")
+        if udder_risk is not None and udder_risk >= 60:
+            explanation.append("Meme")
+        if robot_risk is not None and robot_risk >= 60:
+            explanation.append("Robot")
+        for label, val in [("Geviş", rum_risk), ("Beslenme", feed_risk), ("Aktiflik", activity_risk), ("Süt", milk_risk)]:
+            if val is not None and val >= 70:
+                explanation.append(label)
+        if not explanation and overall is not None and overall >= 20:
+            explanation.append("Birleşik sinyal")
+
+        out.append({
+            "Hayvan No": animal,
+            "Sağım Grubu": group,
+            "Laktasyon No": int(lact) if lact is not None and float(lact).is_integer() else lact,
+            "Laktasyon Günü (DIM)": int(dim) if dim is not None and float(dim).is_integer() else dim,
+            "Üreme Durumu": repro,
+            "Gebe Gün": int(pregnant_days) if pregnant_days is not None and float(pregnant_days).is_integer() else pregnant_days,
+            "Son Tohumlamadan Geçen Gün": int(since_insem) if since_insem is not None and float(since_insem).is_integer() else since_insem,
+            "Geviş Düşüş %": rum_drop,
+            "Geviş Uyarı": "Evet" if rum_warn else ("Hayır" if rum_warn is False else ""),
+            "Geviş Risk": rum_risk,
+            "Beslenme Süre Düşüş %": feed_drop,
+            "Kalan/Talep %": rest_ratio,
+            "Beslenme Uyarı": "Evet" if feed_warn else ("Hayır" if feed_warn is False else ""),
+            "Beslenme Risk": feed_risk,
+            "İnaktiflik Artış %": inactive_increase,
+            "Aktiflik Uyarı": "Evet" if activity_warn else ("Hayır" if activity_warn is False else ""),
+            "Aktiflik Risk": activity_risk,
+            "Süt 7 Gün Ort. (kg/gün)": milk7,
+            "Süt 24 Saat Ort. (kg/gün)": milk24,
+            "Süt Kısa Düşüş %": milk_short_drop,
+            "Ham Süt Son Dönem (kg/gün)": recent_milk,
+            "Ham Süt Önceki Dönem (kg/gün)": prior_milk,
+            "Ham Süt Düşüş %": raw_milk_drop,
+            "Süt Risk": milk_risk,
+            "Genel Sağlık Veri Kapsama %": general_coverage,
+            "Genel Sağlık Risk": general_risk,
+            "İletkenlik FL": cond_values[0],
+            "İletkenlik FR": cond_values[1],
+            "İletkenlik RL": cond_values[2],
+            "İletkenlik RR": cond_values[3],
+            "İletkenlik Asimetri %": cond_asym,
+            "İletkenlik Trend Artışı %": cond_trend,
+            "İletkenlik Alarm Oranı %": cond_alarm_rate,
+            "Beklenen/Gerçek Süt Açığı %": expected_gap,
+            "En Kötü Çeyrek Süt Açığı %": worst_quarter_gap,
+            "Milk Flow Önceki (kg/dk)": prior_flow,
+            "Milk Flow Son (kg/dk)": recent_flow,
+            "Milk Flow Düşüş %": flow_drop,
+            "Süt Verim Alarm Oranı %": yield_alarm_rate,
+            "Meme Veri Kapsama %": udder_coverage,
+            "Meme Sağlığı Risk": udder_risk,
+            "OK Ziyaret Önceki (günlük)": prior_ok_day,
+            "OK Ziyaret Son (günlük)": recent_ok_day,
+            "OK Ziyaret Düşüş %": ok_drop,
+            "Başarısız Ziyaret Artışı (puan)": failed_inc,
+            "Incomplete Artışı (puan)": incomplete_inc,
+            "Attachment Abort Artışı (puan)": abort_inc,
+            "Reattach Artışı %": reattach_inc,
+            "Kickoff Artışı %": kickoff_inc,
+            "Robot Veri Kapsama %": robot_coverage,
+            "Sağım/Robot Risk": robot_risk,
+            "Güçlü Temel Sinyal Sayısı": strong_count,
+            "V2 Veri Kapsama %": overall_coverage,
+            "V2 Genel Öncelik": overall,
+            "V2 Seviye": level,
+            "V2 Açıklama": "; ".join(explanation),
+        })
+
+    risk_df = pd.DataFrame(out)
+    risk_df = risk_df.sort_values(["V2 Genel Öncelik", "Hayvan No"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    risk_df.insert(risk_df.columns.get_loc("V2 Seviye") + 1, "V2 Sıra", np.arange(1, len(risk_df) + 1))
+
+    level_counts = risk_df["V2 Seviye"].value_counts().to_dict()
+    milk_values = pd.to_numeric(risk_df["Süt 7 Gün Ort. (kg/gün)"], errors="coerce").dropna()
+    dim_values = pd.to_numeric(risk_df["Laktasyon Günü (DIM)"], errors="coerce")
+    lactating = int(((dim_values > 0) & (risk_df["Üreme Durumu"] != "Kuru")).sum())
+
+    lact_rows = []
+    for lact_no, g in risk_df.groupby("Laktasyon No", dropna=True):
+        vals = pd.to_numeric(g["Süt 7 Gün Ort. (kg/gün)"], errors="coerce").dropna()
+        lact_rows.append({
+            "Laktasyon": f"{int(lact_no)}. Laktasyon" if float(lact_no).is_integer() else str(lact_no),
+            "Hayvan Sayısı": int(len(g)),
+            "Süt Verisi Olan Hayvan": int(len(vals)),
+            "Ortalama Süt (kg/gün)": float(vals.mean()) if not vals.empty else None,
+        })
+    lactation_df = pd.DataFrame(lact_rows)
+
+    repro_counts = risk_df["Üreme Durumu"].value_counts()
+    reproduction_df = pd.DataFrame([
+        {"Üreme Durumu": x, "Hayvan Sayısı": int(repro_counts.get(x, 0))}
+        for x in TURKISH_REPRO_ORDER if int(repro_counts.get(x, 0)) > 0
+    ])
+
+    summary = {
+        "Analiz Edilen Hayvan": int(len(risk_df)),
+        "Laktasyondaki Hayvan": lactating,
+        "SAĞMAL 1": int((risk_df["Sağım Grubu"] == "SAĞMAL 1").sum()),
+        "SAĞMAL 2": int((risk_df["Sağım Grubu"] == "SAĞMAL 2").sum()),
+        "Süt Verisi Olan Hayvan": int(len(milk_values)),
+        "7 Günlük Süt Ortalaması (kg/gün)": float(milk_values.mean()) if not milk_values.empty else None,
+        "V2 Yüksek Risk": int(level_counts.get("YÜKSEK", 0)),
+        "V2 Orta Risk": int(level_counts.get("ORTA", 0)),
+        "V2 İzle": int(level_counts.get("İZLE", 0)),
+        "V2 Düşük Risk": int(level_counts.get("DÜŞÜK", 0)),
+        "V2 Veri Eksik": int(level_counts.get("VERİ EKSİK", 0)),
+        "Aktiflik Verisi Olan": int(risk_df["Aktiflik Risk"].notna().sum()),
+        "Meme Skoru Olan": int(risk_df["Meme Sağlığı Risk"].notna().sum()),
+        "Robot Skoru Olan": int(risk_df["Sağım/Robot Risk"].notna().sum()),
+        "Süt Dosyasındaki Son Gün": str(max(dates)),
+        "Trendde Kullanılan Son Tam Gün": str(max(recent_dates)) if recent_dates else None,
+        "Önceki Trend Dönemi": f"{min(prior_dates)} – {max(prior_dates)}" if prior_dates else "Yetersiz veri",
+        "Son Trend Dönemi": f"{min(recent_dates)} – {max(recent_dates)}" if recent_dates else "Yetersiz veri",
+        "Trend Dışında Tutulan Kısmi Günler": ", ".join(map(str, sorted(excluded))) if excluded else "Yok",
+    }
+
+    methodology_rows = [
+        ("Model", "V2 deneysel risk modeli"),
+        ("Klinik kullanım", "Klinik tanı değildir; kontrol önceliklendirmesi için tarama modelidir."),
+        ("Genel Sağlık", "Geviş %25 + Beslenme %20 + Aktiflik %20 + Süt %20 + Robot %15; eksik bileşenlerde mevcut ağırlıklar normalize edilir."),
+        ("Meme Sağlığı", "İletkenlik asimetrisi/trendi/alarmı + beklenen-gerçek süt açığı + çeyrek süt açığı + milk flow + süt verim alarmı."),
+        ("Sağım/Robot", "Mutlak hata yerine önceki ve son dönem arasındaki kötüleşme kullanılır."),
+        ("V2 Genel Öncelik", "Genel Sağlık %60 + Meme %25 + Sağım/Robot %15; veri yoksa mevcut kategoriler normalize edilir."),
+        ("Eskalasyon", "Genel Sağlık yüksek + çoklu güçlü sinyal, Meme çok yüksek veya Genel+Meme birlikte yüksekse öncelik tabanı yükseltilir."),
+        ("Risk eşikleri", "YÜKSEK ≥65; ORTA ≥40; İZLE ≥20; DÜŞÜK <20."),
+        ("Üreme", "PREGNANT/PREGNANT2=Gebe; INSEMINATED=Tohumlu; OPEN=Açık; EARLY=Erken; READY=Tohumlamaya Hazır; DRY=Kuru."),
+        ("Gebe Gün", "Yalnızca üreme durumu Gebe olan hayvanlarda DaysPregnant gösterilir."),
+        ("Ham süt trendi", f"Önceki dönem: {summary['Önceki Trend Dönemi']}; son dönem: {summary['Son Trend Dönemi']}."),
+        ("Kısmi günler", summary["Trend Dışında Tutulan Kısmi Günler"]),
+        ("İletkenlik asimetrisi", "Feed dosyasındaki dört çeyrek iletkenliğinde en yüksek çeyreğin medyana göre artışı."),
+        ("Veri güvenliği", "Web uygulaması ham yüklemeleri kalıcı diske yazmaz; analiz sonucu yalnızca oturum belleğinde tutulur ve oturum silindiğinde kaldırılır."),
+    ]
+    methodology_df = pd.DataFrame(methodology_rows, columns=["Konu", "Açıklama"])
+
+    return AnalysisResult(
+        risk=risk_df,
+        summary=summary,
+        lactation=lactation_df,
+        reproduction=reproduction_df,
+        methodology=methodology_df,
+    )
