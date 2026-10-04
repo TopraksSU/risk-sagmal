@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+import csv
+import io
+import math
+import statistics
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# V2 parameters reproduced from the experimental workbook.
+PARAMS = {
+    # General health
+    "general_rumination_weight": 0.25,
+    "general_feeding_weight": 0.20,
+    "general_activity_weight": 0.20,
+    "general_milk_weight": 0.20,
+    "general_robot_weight": 0.15,
+    "rumination_full_risk_drop": 0.25,
+    "feeding_duration_full_risk_drop": 0.30,
+    "feeding_duration_subweight": 0.70,
+    "feed_remaining_subweight": 0.30,
+    "feed_remaining_full_risk": 0.30,
+    "inactive_full_risk_increase": 0.25,
+    "milk_full_risk_drop": 0.25,
+    "warning_floor": 80.0,
+    # Udder
+    "udder_cond_asym_weight": 0.25,
+    "udder_cond_trend_weight": 0.20,
+    "udder_cond_alarm_weight": 0.10,
+    "udder_expected_gap_weight": 0.15,
+    "udder_quarter_gap_weight": 0.15,
+    "udder_flow_weight": 0.10,
+    "udder_yield_alarm_weight": 0.05,
+    "cond_asym_full_risk": 0.20,
+    "cond_trend_full_risk": 0.15,
+    "cond_alarm_full_risk": 0.25,
+    "expected_gap_full_risk": 0.25,
+    "quarter_gap_full_risk": 0.30,
+    "flow_full_risk_drop": 0.25,
+    "yield_alarm_full_risk": 0.30,
+    # Robot
+    "robot_ok_drop_weight": 0.30,
+    "robot_failed_inc_weight": 0.20,
+    "robot_incomplete_inc_weight": 0.20,
+    "robot_abort_inc_weight": 0.10,
+    "robot_reattach_inc_weight": 0.10,
+    "robot_kickoff_inc_weight": 0.10,
+    "robot_ok_drop_full_risk": 0.30,
+    "robot_rate_inc_full_risk": 0.20,
+    "robot_reattach_full_risk": 0.50,
+    "robot_kickoff_full_risk": 0.50,
+    # Overall V2
+    "overall_general_weight": 0.60,
+    "overall_udder_weight": 0.25,
+    "overall_robot_weight": 0.15,
+    "high_threshold": 65.0,
+    "medium_threshold": 40.0,
+    "watch_threshold": 20.0,
+    "strong_signal_threshold": 60.0,
+    "general_escalation_threshold": 70.0,
+    "multi_signal_count_threshold": 2,
+    "udder_escalation_threshold": 80.0,
+    "udder_escalation_floor": 60.0,
+    "general_udder_joint_threshold": 60.0,
+    "general_udder_joint_floor": 75.0,
+}
+
+STATUS_MAP = {
+    "PREGNANT2": "Gebe",
+    "PREGNANT": "Gebe",
+    "INSEMINATED": "Tohumlu",
+    "OPEN": "Açık",
+    "EARLY": "Erken",
+    "READY": "Tohumlamaya Hazır",
+    "FRESH": "Yeni Doğum",
+    "ABORT": "Abort",
+    "TBCULL": "Sürüden Çıkarılacak",
+    "DRY": "Kuru",
+}
+
+TURKISH_REPRO_ORDER = [
+    "Gebe", "Tohumlu", "Açık", "Erken", "Tohumlamaya Hazır",
+    "Yeni Doğum", "Abort", "Sürüden Çıkarılacak", "Kuru", "Durum Verisi Yok",
+]
+
+
+@dataclass
+class AnalysisResult:
+    risk: pd.DataFrame
+    summary: Dict[str, object]
+    lactation: pd.DataFrame
+    reproduction: pd.DataFrame
+    methodology: pd.DataFrame
+
+
+def _detect_separator(text: str) -> str:
+    sample = text[:8192]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
+    except csv.Error:
+        first = sample.splitlines()[0] if sample else ""
+        return ";" if first.count(";") > first.count(",") else ","
+
+
+def _read_csv_text(text: str) -> pd.DataFrame:
+    sep = _detect_separator(text)
+    return pd.read_csv(
+        io.StringIO(text), sep=sep, dtype=str, keep_default_na=False,
+        na_values=[], on_bad_lines="skip",
+    )
+
+
+def _num(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(dtype=float)
+    x = s.astype(str).str.strip()
+    both = x.str.contains(r"\.", regex=True) & x.str.contains(",", regex=False)
+    comma_decimal = both & (x.str.rfind(",") > x.str.rfind("."))
+    x.loc[comma_decimal] = x.loc[comma_decimal].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    x.loc[both & ~comma_decimal] = x.loc[both & ~comma_decimal].str.replace(",", "", regex=False)
+    x.loc[~both] = x.loc[~both].str.replace(",", ".", regex=False)
+    return pd.to_numeric(x, errors="coerce")
+
+
+def _scalar_num(v) -> Optional[float]:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _bool_scalar(v) -> Optional[bool]:
+    if v is None:
+        return None
+    s = str(v).strip().casefold()
+    if not s:
+        return None
+    if s in {"true", "1", "yes", "evet", "ok", "success", "successful"}:
+        return True
+    if s in {"false", "0", "no", "hayır", "hayir", "failed", "failure"}:
+        return False
+    return None
+
+
+def _bool_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.casefold().map({
+        "true": True, "1": True, "yes": True, "evet": True, "ok": True,
+        "false": False, "0": False, "no": False, "hayır": False, "hayir": False,
+    })
+
+
+def _time_minutes(v) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) in (2, 3) and all(p.replace(".", "", 1).isdigit() for p in parts):
+        try:
+            h, m = float(parts[0]), float(parts[1])
+            sec = float(parts[2]) if len(parts) == 3 else 0.0
+            return h * 60 + m + sec / 60
+        except ValueError:
+            pass
+    x = _scalar_num(v)
+    if x is None:
+        return None
+    if 0 <= x < 1:
+        return x * 1440
+    if x > 1000:
+        return (x - math.floor(x)) * 1440
+    if x > 24:
+        return x
+    return x * 60
+
+
+def _drop(current: Optional[float], baseline: Optional[float]) -> Optional[float]:
+    if current is None or baseline is None or baseline <= 0:
+        return None
+    return max(0.0, (baseline - current) / baseline)
+
+
+def _increase(current: Optional[float], baseline: Optional[float]) -> Optional[float]:
+    if current is None or baseline is None or baseline <= 0:
+        return None
+    return max(0.0, (current - baseline) / baseline)
+
+
+def _scaled(value: Optional[float], threshold: float) -> Optional[float]:
+    if value is None:
+        return None
+    return min(100.0, max(0.0, value / threshold * 100.0))
+
+
+def _weighted_available(parts: Iterable[Tuple[Optional[float], float]]) -> Tuple[Optional[float], float]:
+    used = [(v, w) for v, w in parts if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    total_all = sum(w for _, w in parts)
+    total_used = sum(w for _, w in used)
+    if not used or total_used <= 0:
+        return None, 0.0
+    score = sum(v * w for v, w in used) / total_used
+    coverage = 100.0 * total_used / total_all if total_all else 0.0
+    return score, coverage
+
+
+def _required(df: pd.DataFrame, cols: List[str], label: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label} dosyasında gerekli sütun(lar) eksik: {', '.join(missing)}")
+
+
+def _row_for(df: pd.DataFrame, key_col: str, animal: int) -> Optional[pd.Series]:
+    sub = df[df[key_col] == animal]
+    return None if sub.empty else sub.iloc[0]
+
+
+def _period_mean(sub: pd.DataFrame, col: str, days: set[date]) -> Optional[float]:
+    if col not in sub.columns:
+        return None
+    x = sub.loc[sub["__date"].isin(days), col]
+    x = pd.to_numeric(x, errors="coerce").dropna()
+    return None if x.empty else float(x.mean())
+
+
+def _period_rate_any(sub: pd.DataFrame, cols: List[str], days: set[date]) -> Optional[float]:
+    cols = [c for c in cols if c in sub.columns]
+    if not cols:
+        return None
+    d = sub[sub["__date"].isin(days)]
+    if d.empty:
+        return None
+    available = pd.DataFrame({c: _bool_series(d[c]) for c in cols})
+    valid = available.notna().any(axis=1)
+    if not valid.any():
+        return None
