@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>risk-sagmal.com | Sürü Risk Analizi V2</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">SÜRÜ SAĞLIK TAKİBİ</div>
+      <h1>Sürü Risk Analizi <span>V2</span></h1>
+      <p>Sağlık, beslenme, süt, meme sağlığı, aktiflik ve robot davranışını tek ekranda birleştirir.</p>
+    </div>
+    <div class="privacy-pill">🔒 Kalıcı veri saklama yok</div>
+  </header>
+
+  <main>
+    <section class="panel upload-panel">
+      <div class="section-head">
+        <div>
+          <h2>1. Verileri yükle</h2>
+          <p>Dört CSV dosyasını seç. Dosyalar tarayıcıda okunur ve analiz için bellekte işlenir.</p>
+        </div>
+      </div>
+
+      <div class="upload-grid">
+        <label class="upload-card"><b>Sağlık ve Yönetim</b><span>Geviş, beslenme, aktiflik</span><input id="saglik" type="file" accept=".csv,text/csv"><em>CSV seç</em></label>
+        <label class="upload-card"><b>Beslenme / Robot Özeti</b><span>Süt, yem, laktasyon, iletkenlik</span><input id="beslenme" type="file" accept=".csv,text/csv"><em>CSV seç</em></label>
+        <label class="upload-card"><b>Ham Süt Verisi</b><span>Sağım, çeyrek, alarm, robot trendleri</span><input id="sut" type="file" accept=".csv,text/csv"><em>CSV seç</em></label>
+        <label class="upload-card"><b>Üreme / Export</b><span>Durum, DIM, sağım grubu</span><input id="ureme" type="file" accept=".csv,text/csv"><em>CSV seç</em></label>
+      </div>
+
+      <div id="fileStatus" class="file-status">4 dosya bekleniyor.</div>
+      <div class="actions">
+        <button id="analyzeBtn" class="primary" disabled>V2 Analizini Başlat</button>
+        <button id="clearBtn" class="danger ghost">Oturumu kapat ve verileri sil</button>
+      </div>
+      <p class="security-note"><strong>Güvenlik:</strong> Ham CSV içerikleri sunucuda dosyaya yazılmaz ve analizden sonra sunucu tarafında tutulmaz. Hesaplanan sonuç yalnızca bu tarayıcı sayfasının belleğinde kalır. Sayfa/oturum kapandığında tarayıcı belleğiyle birlikte kaybolur; Excel/CSV oluşturma da tek seferlik istektir.</p>
+    </section>
+
+    <section id="loading" class="panel loading hidden"><div class="spinner"></div><div><b>Analiz yapılıyor…</b><span>V2 risk bileşenleri hesaplanıyor.</span></div></section>
+    <section id="errorBox" class="error hidden"></section>
+
+    <section id="results" class="hidden">
+      <div class="section-head result-head">
+        <div><div class="eyebrow">ANALİZ SONUCU</div><h2>V2 Sürü Özeti</h2></div>
+        <div class="actions compact"><button id="excelBtn" class="primary">Excel indir</button><button id="csvBtn" class="secondary">CSV indir</button></div>
+      </div>
+
+      <div id="kpis" class="kpi-grid"></div>
+
+      <div class="two-col">
+        <section class="panel"><h3>Üreme Durumu</h3><div id="reproTable"></div></section>
+        <section class="panel"><h3>Laktasyon ve Süt</h3><div id="lactTable"></div></section>
+      </div>
+
+      <section class="panel">
+        <div class="section-head"><div><h3>Öncelikli Hayvanlar</h3><p>V2 Genel Öncelik puanına göre ilk 25 hayvan.</p></div><span class="badge">V2</span></div>
+        <div class="table-wrap"><table id="riskTable"><thead></thead><tbody></tbody></table></div>
+      </section>
+
+      <div class="disclaimer">Bu risk modeli klinik tanı değildir. Veteriner/saha kontrolünü önceliklendirmek için tasarlanmıştır.</div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
