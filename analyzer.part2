@@ -1,0 +1,244 @@
+    any_true = available.fillna(False).any(axis=1)
+    return float(any_true[valid].mean())
+
+
+def _period_numeric_event_mean(sub: pd.DataFrame, cols: List[str], days: set[date]) -> Optional[float]:
+    cols = [c for c in cols if c in sub.columns]
+    if not cols:
+        return None
+    d = sub[sub["__date"].isin(days)]
+    if d.empty:
+        return None
+    acc = pd.Series(0.0, index=d.index)
+    any_valid = pd.Series(False, index=d.index)
+    for c in cols:
+        numeric = pd.to_numeric(d[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        b = _bool_series(d[c]).map({True: 1.0, False: 0.0})
+        combined = numeric.where(numeric.notna(), b)
+        any_valid |= combined.notna()
+        acc += combined.fillna(0.0)
+    if not any_valid.any():
+        return None
+    return float(acc[any_valid].mean())
+
+
+def _relative_increase(recent: Optional[float], prior: Optional[float]) -> Optional[float]:
+    if recent is None or prior is None:
+        return None
+    if prior > 0:
+        return max(0.0, (recent - prior) / prior)
+    return 1.0 if recent > 0 else 0.0
+
+
+def analyze_v2(health_text: str, feed_text: str, milk_text: str, status_text: str) -> AnalysisResult:
+    health = _read_csv_text(health_text)
+    feed = _read_csv_text(feed_text)
+    milk = _read_csv_text(milk_text)
+    status = _read_csv_text(status_text)
+
+    _required(health, ["Numara", "Beslenme süresi Toplam", "Beslenme süresi Ortalama", "Geviş getirme Toplam", "Geviş getirme Ortalama"], "Sağlık")
+    _required(feed, ["AnimalNumber", "LactationNumber", "7dAverageMilk (kg)", "24hAverageMilk (kg)"], "Beslenme/robot")
+    _required(milk, ["date_filter", "animalnumber_filter", "mvc_grossmilkamountingram"], "Süt")
+    _required(status, ["Hayvan numarası", "Durum", "Sağım grubu"], "Üreme/export")
+
+    health["__animal"] = _num(health["Numara"]).astype("Int64")
+    feed["__animal"] = _num(feed["AnimalNumber"]).astype("Int64")
+    milk["__animal"] = _num(milk["animalnumber_filter"]).astype("Int64")
+    status["__animal"] = _num(status["Hayvan numarası"]).astype("Int64")
+    status = status[status["__animal"].notna()].copy()
+    status["__animal"] = status["__animal"].astype(int)
+    animals = status["__animal"].drop_duplicates().tolist()
+
+    health = health[health["__animal"].notna()].drop_duplicates("__animal", keep="first").copy()
+    feed = feed[feed["__animal"].notna()].drop_duplicates("__animal", keep="first").copy()
+    health["__animal"] = health["__animal"].astype(int)
+    feed["__animal"] = feed["__animal"].astype(int)
+
+    milk = milk[milk["__animal"].notna()].copy()
+    milk["__animal"] = milk["__animal"].astype(int)
+    milk = milk[milk["__animal"].isin(animals)]
+    milk["__date"] = pd.to_datetime(milk["date_filter"], errors="coerce", utc=True).dt.date
+    milk["__milkkg"] = _num(milk["mvc_grossmilkamountingram"]) / 1000.0
+    milk = milk[milk["__date"].notna()]
+
+    herd_daily = milk.groupby("__date")["__milkkg"].sum(min_count=1).dropna().sort_index()
+    if herd_daily.empty:
+        raise ValueError("Süt dosyasında analiz edilebilir günlük süt kaydı bulunamadı.")
+    dates = list(herd_daily.index)
+    excluded: List[date] = []
+    if len(dates) >= 2:
+        prev = herd_daily.iloc[max(0, len(herd_daily)-8):-1]
+        med = float(prev.median()) if not prev.empty else None
+        if med and herd_daily.iloc[-1] < 0.70 * med:
+            excluded.append(dates[-1])
+    complete_dates = [d for d in dates if d not in excluded]
+    if len(complete_dates) >= 4:
+        comparison = [float(herd_daily.loc[d]) for d in complete_dates[1:6]]
+        med_first = statistics.median(comparison) if comparison else None
+        if med_first and float(herd_daily.loc[complete_dates[0]]) < 0.80 * med_first:
+            excluded.append(complete_dates[0])
+    complete_dates = [d for d in dates if d not in set(excluded)]
+    if len(complete_dates) >= 6:
+        recent_dates = set(complete_dates[-3:])
+        prior_dates = set(complete_dates[-6:-3])
+    elif len(complete_dates) >= 4:
+        split = len(complete_dates) // 2
+        prior_dates = set(complete_dates[:split])
+        recent_dates = set(complete_dates[split:])
+    else:
+        prior_dates = set(complete_dates[:-1])
+        recent_dates = set(complete_dates[-1:])
+
+    numeric_raw_cols = [
+        "mvc_conductivityvalue", "mvc_expectedmilkingram", "mvc_milkflowingramperminute",
+        "mvc_fl_expectedmilkingram", "mvc_fr_expectedmilkingram", "mvc_rl_expectedmilkingram", "mvc_rr_expectedmilkingram",
+        "mvc_fl_milkyieldingram", "mvc_fr_milkyieldingram", "mvc_rl_milkyieldingram", "mvc_rr_milkyieldingram",
+        "mvpr_reattach_general", "mvpr_kickoff_fl", "mvpr_kickoff_fr", "mvpr_kickoff_rl", "mvpr_kickoff_rr",
+    ]
+    for c in numeric_raw_cols:
+        if c in milk.columns:
+            milk[c] = _num(milk[c])
+
+    health_by = health.set_index("__animal", drop=False)
+    feed_by = feed.set_index("__animal", drop=False)
+    status_by = status.drop_duplicates("__animal", keep="first").set_index("__animal", drop=False)
+
+    daily_milk = milk.groupby(["__animal", "__date"])["__milkkg"].sum(min_count=1)
+
+    out: List[dict] = []
+    for animal in animals:
+        s = status_by.loc[animal]
+        h = health_by.loc[animal] if animal in health_by.index else None
+        f = feed_by.loc[animal] if animal in feed_by.index else None
+        m = milk[milk["__animal"] == animal]
+
+        raw_status = str(s.get("Durum", "")).strip()
+        repro = STATUS_MAP.get(raw_status, "Durum Verisi Yok")
+        group = str(s.get("Sağım grubu", "")).strip() or None
+
+        lact = _scalar_num(f.get("LactationNumber")) if f is not None else None
+        if lact is None:
+            lact = _scalar_num(s.get("Laktasyon no"))
+        dim = _scalar_num(f.get("DaysInMilk")) if f is not None and "DaysInMilk" in f.index else None
+        if dim is None and h is not None:
+            dim = _scalar_num(h.get("Laktasyondaki günler"))
+        if dim is None:
+            dim = _scalar_num(s.get("Laktasyon günü"))
+        days_preg = _scalar_num(f.get("DaysPregnant")) if f is not None and "DaysPregnant" in f.index else None
+        pregnant_days = days_preg if repro == "Gebe" and days_preg is not None and days_preg > 0 else None
+        since_insem = _scalar_num(s.get("Son tohumlamadan bu yana geçen gün"))
+
+        rum_cur = _scalar_num(h.get("Geviş getirme Toplam")) if h is not None else None
+        rum_avg = _scalar_num(h.get("Geviş getirme Ortalama")) if h is not None else None
+        rum_drop = _drop(rum_cur, rum_avg)
+        rum_warn = _bool_scalar(h.get("Geviş getirme Uyarı")) if h is not None else None
+        rum_risk = _scaled(rum_drop, PARAMS["rumination_full_risk_drop"])
+        if rum_warn:
+            rum_risk = max(rum_risk or 0.0, PARAMS["warning_floor"])
+
+        feed_cur = _time_minutes(h.get("Beslenme süresi Toplam")) if h is not None else None
+        feed_avg = _time_minutes(h.get("Beslenme süresi Ortalama")) if h is not None else None
+        feed_drop = _drop(feed_cur, feed_avg)
+        claim = _scalar_num(f.get("FeedClaimYesterday")) if f is not None and "FeedClaimYesterday" in f.index else None
+        rest = _scalar_num(f.get("FeedRestYesterday")) if f is not None and "FeedRestYesterday" in f.index else None
+        rest_ratio = max(0.0, rest / claim) if claim not in (None, 0) and rest is not None else None
+        feed_duration_risk = _scaled(feed_drop, PARAMS["feeding_duration_full_risk_drop"])
+        rest_risk = _scaled(rest_ratio, PARAMS["feed_remaining_full_risk"])
+        feed_risk, _ = _weighted_available([
+            (feed_duration_risk, PARAMS["feeding_duration_subweight"]),
+            (rest_risk, PARAMS["feed_remaining_subweight"]),
+        ])
+        feed_warn = _bool_scalar(h.get("Beslenme süresi Uyarı")) if h is not None else None
+        if feed_warn:
+            feed_risk = max(feed_risk or 0.0, PARAMS["warning_floor"])
+
+        inactive_cur = _time_minutes(h.get("Aktif değil Toplam")) if h is not None and "Aktif değil Toplam" in h.index else None
+        inactive_avg = _time_minutes(h.get("Aktif değil Ortalama")) if h is not None and "Aktif değil Ortalama" in h.index else None
+        inactive_increase = _increase(inactive_cur, inactive_avg)
+        activity_risk = _scaled(inactive_increase, PARAMS["inactive_full_risk_increase"])
+        activity_warn = _bool_scalar(h.get("Aktif değil Uyarı")) if h is not None and "Aktif değil Uyarı" in h.index else None
+        if activity_warn:
+            activity_risk = max(activity_risk or 0.0, PARAMS["warning_floor"])
+
+        milk7 = _scalar_num(f.get("7dAverageMilk (kg)")) if f is not None else None
+        milk24 = _scalar_num(f.get("24hAverageMilk (kg)")) if f is not None else None
+        milk_short_drop = _drop(milk24, milk7)
+        recent_vals = [daily_milk.get((animal, d), np.nan) for d in recent_dates]
+        prior_vals = [daily_milk.get((animal, d), np.nan) for d in prior_dates]
+        recent_valid = [float(x) for x in recent_vals if pd.notna(x)]
+        prior_valid = [float(x) for x in prior_vals if pd.notna(x)]
+        recent_milk = float(np.mean(recent_valid)) if len(recent_valid) >= min(2, len(recent_dates)) and recent_valid else None
+        prior_milk = float(np.mean(prior_valid)) if len(prior_valid) >= min(2, len(prior_dates)) and prior_valid else None
+        raw_milk_drop = _drop(recent_milk, prior_milk)
+        short_risk = _scaled(milk_short_drop, PARAMS["milk_full_risk_drop"])
+        raw_risk = _scaled(raw_milk_drop, PARAMS["milk_full_risk_drop"])
+        milk_risk, _ = _weighted_available([(short_risk, 0.5), (raw_risk, 0.5)])
+
+        cond_values = []
+        for c in ["ConductivityFL", "ConductivityFR", "ConductivityRL", "ConductivityRR"]:
+            cond_values.append(_scalar_num(f.get(c)) if f is not None and c in f.index else None)
+        valid_cond = [x for x in cond_values if x is not None and x > 0]
+        if len(valid_cond) >= 3:
+            med_cond = float(np.median(valid_cond))
+            cond_asym = max(0.0, max(valid_cond) / med_cond - 1.0) if med_cond > 0 else None
+        else:
+            cond_asym = None
+
+        if "mvc_conductivityvalue" in m.columns:
+            prior_cond = _period_mean(m, "mvc_conductivityvalue", prior_dates)
+            recent_cond = _period_mean(m, "mvc_conductivityvalue", recent_dates)
+        else:
+            prior_cond = recent_cond = None
+        if prior_cond is None or recent_cond is None:
+            quarter_cols = [c for c in ["mvc_fl_conductivityvalue", "mvc_fr_conductivityvalue", "mvc_rl_conductivityvalue", "mvc_rr_conductivityvalue"] if c in m.columns]
+            if quarter_cols:
+                mm = m.copy()
+                for c in quarter_cols:
+                    mm[c] = _num(mm[c]) if not pd.api.types.is_numeric_dtype(mm[c]) else mm[c]
+                mm["__cond_mean"] = mm[quarter_cols].mean(axis=1, skipna=True)
+                prior_cond = _period_mean(mm, "__cond_mean", prior_dates)
+                recent_cond = _period_mean(mm, "__cond_mean", recent_dates)
+        cond_trend = _increase(recent_cond, prior_cond)
+
+        cond_alarm_cols = [
+            "mvc_fl_conductivityalarm", "mvc_fr_conductivityalarm",
+            "mvc_rl_conductivityalarm", "mvc_rr_conductivityalarm",
+        ]
+        cond_alarm_rate = _period_rate_any(m, cond_alarm_cols, recent_dates)
+
+        def _sum_period(col: str, days: set[date]) -> Optional[float]:
+            if col not in m.columns:
+                return None
+            x = pd.to_numeric(m.loc[m["__date"].isin(days), col], errors="coerce").dropna()
+            return None if x.empty else float(x.sum())
+
+        exp_total = _sum_period("mvc_expectedmilkingram", recent_dates)
+        actual_total = float(m.loc[m["__date"].isin(recent_dates), "__milkkg"].sum() * 1000) if not m.loc[m["__date"].isin(recent_dates)].empty else None
+        expected_gap = max(0.0, (exp_total - actual_total) / exp_total) if exp_total not in (None, 0) and actual_total is not None else None
+
+        quarter_gaps = []
+        for q in ["fl", "fr", "rl", "rr"]:
+            ex = _sum_period(f"mvc_{q}_expectedmilkingram", recent_dates)
+            ac = _sum_period(f"mvc_{q}_milkyieldingram", recent_dates)
+            if ex not in (None, 0) and ac is not None:
+                quarter_gaps.append(max(0.0, (ex - ac) / ex))
+        worst_quarter_gap = max(quarter_gaps) if quarter_gaps else None
+
+        prior_flow = _period_mean(m, "mvc_milkflowingramperminute", prior_dates)
+        recent_flow = _period_mean(m, "mvc_milkflowingramperminute", recent_dates)
+        if prior_flow is not None:
+            prior_flow /= 1000.0
+        if recent_flow is not None:
+            recent_flow /= 1000.0
+        flow_drop = _drop(recent_flow, prior_flow)
+
+        yield_alarm_cols = [
+            "mvc_milkyieldalarm", "mvc_fl_milkyieldalarm", "mvc_fr_milkyieldalarm",
+            "mvc_rl_milkyieldalarm", "mvc_rr_milkyieldalarm",
+        ]
+        yield_alarm_rate = _period_rate_any(m, yield_alarm_cols, recent_dates)
+
+        udder_risk, udder_coverage = _weighted_available([
+            (_scaled(cond_asym, PARAMS["cond_asym_full_risk"]), PARAMS["udder_cond_asym_weight"]),
+            (_scaled(cond_trend, PARAMS["cond_trend_full_risk"]), PARAMS["udder_cond_trend_weight"]),
+            (_scaled(cond_alarm_rate, PARAMS["cond_alarm_full_risk"]), PARAMS["udder_cond_alarm_weight"]),
